@@ -185,8 +185,15 @@ def http_get(url: str, timeout: int = 20) -> str:
     })
     with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read(1_500_000)  # статьи бывают тяжёлыми — читаем не больше 1,5 МБ
-        charset = r.headers.get_content_charset() or "utf-8"
-    return raw.decode(charset, errors="replace")
+        charset = r.headers.get_content_charset()
+    if not charset:
+        # кодировка не указана в заголовках — ищем её в самой странице (часто windows-1251)
+        m = re.search(rb'<meta[^>]+charset=["\']?([\w-]+)', raw[:4000], flags=re.I)
+        charset = m.group(1).decode() if m else "utf-8"
+    try:
+        return raw.decode(charset, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
 
 
 def http_post(url: str, data: dict, timeout: int = 20) -> str:
@@ -293,8 +300,11 @@ META_PATTERNS = [
 # Служебные фразы сайтов, которые не являются описанием статьи
 BOILERPLATE = [
     "cookie", "всегда актуальные новости", "последние новости", "читайте также",
-    "подписывайтесь", "все права защищены", "главные новости",
+    "подписывайтесь", "все права защищены", "главные новости", "наш телеграм",
+    "telegram-канал", "телеграм-канал", "присоединяйтесь", "erid",
 ]
+# С чего начинаются подписи к фото и прочие служебные абзацы
+SKIP_PREFIXES = ("фото", "источник", "читайте", "подпис", "видео:", "смотрите", "автор:")
 
 
 def clean(text: str) -> str:
@@ -310,13 +320,89 @@ def is_boilerplate(text: str) -> bool:
     return bool(re.search(r"[{}]|\w+\s*:\s*#[0-9a-f]{3,6}|function\s*\(", low))
 
 
-def first_paragraph(page: str) -> str:
-    """Запасной вариант: первый содержательный абзац статьи."""
-    for p in re.findall(r"<p[^>]*>(.*?)</p>", page, flags=re.S | re.I):
-        t = clean(p)
-        if len(t) > 80 and not is_boilerplate(t):
-            return t
+def good_text(t: str) -> bool:
+    """Нормальный абзац текста: достаточно длинный, по-русски, не служебный."""
+    low = t.lower()
+    return (len(t) >= 60 and re.search(r"[а-яё]{3}", low) is not None
+            and not low.startswith(SKIP_PREFIXES) and not is_boilerplate(t))
+
+
+def repeats_title(text: str, title: str) -> bool:
+    """Текст почти дословно повторяет заголовок — такой «пересказ» бесполезен."""
+    if text.lower().startswith(title.lower()[:40]):
+        return True
+    tw, xw = title_words(title), title_words(text)
+    return bool(xw) and len(tw & xw) / len(xw) >= 0.8
+
+
+def meta_description(page: str) -> str:
+    for pat in META_PATTERNS:
+        m = re.search(pat, page, flags=re.I)
+        if m:
+            d = clean(m.group(1))
+            if len(d) >= 40 and not is_boilerplate(d):
+                return d
     return ""
+
+
+def jsonld_fields(page: str) -> dict:
+    """Многие сайты прячут текст статьи в разметке JSON-LD (articleBody, description)."""
+    found = {}
+
+    def walk(x):
+        if isinstance(x, dict):
+            for k in ("articleBody", "description"):
+                v = x.get(k)
+                if isinstance(v, str) and k not in found and len(v) > 40:
+                    found[k] = clean(v)
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    for block in re.findall(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>',
+                            page, flags=re.S | re.I):
+        try:
+            walk(json.loads(block.strip()))
+        except ValueError:
+            continue
+    return found
+
+
+def article_paragraphs(page: str) -> list:
+    """Абзацы самой статьи: без меню, подвала, подписей к фото и рекламы."""
+    body = re.sub(r"<(script|style|noscript|header|footer|nav|aside|figure|figcaption|form)"
+                  r"\b.*?</\1>", " ", page, flags=re.S | re.I)
+    articles = re.findall(r"<article\b.*?</article>", body, flags=re.S | re.I)
+    if articles:
+        body = max(articles, key=len)
+    paras, seen = [], set()
+    for p in re.findall(r"<p\b[^>]*>(.*?)</p>", body, flags=re.S | re.I):
+        t = clean(p)
+        if good_text(t) and t not in seen:
+            seen.add(t)
+            paras.append(t)
+    return paras
+
+
+# Сокращения, после которых точка — не конец предложения
+ABBREVIATIONS = ("г.", "гг.", "ул.", "д.", "пр.", "просп.", "наб.", "пл.", "пер.", "им.",
+                 "т.", "т.е.", "т.д.", "т.п.", "св.", "кв.", "м.", "млн.", "млрд.", "руб.", "в.")
+
+
+def split_sentences(text: str) -> list:
+    parts = [s.strip() for s in re.split(r"(?<=[.!?…])\s+(?=[А-ЯЁA-Z«\"0-9])", text) if s.strip()]
+    merged = []
+    for p in parts:
+        prev = merged[-1] if merged else ""
+        last_word = prev.rsplit(" ", 1)[-1].lower() if prev else ""
+        # «Ф.» (инициал) или «ул.» — склеиваем со следующим куском
+        if prev and (re.fullmatch(r"[а-яёa-z]\.", last_word) or last_word in ABBREVIATIONS):
+            merged[-1] = f"{prev} {p}"
+        else:
+            merged.append(p)
+    return merged
 
 
 def shorten(text: str, limit: int = SUMMARY_MAX_CHARS) -> str:
@@ -330,28 +416,45 @@ def shorten(text: str, limit: int = SUMMARY_MAX_CHARS) -> str:
     return cut.rsplit(" ", 1)[0] + "…"
 
 
+def build_summary(page: str, title: str) -> str:
+    """
+    Краткое описание: лид статьи, а если он короткий или пустой —
+    добираем первые предложения из текста самой статьи (до ~300 символов).
+    """
+    ld = jsonld_fields(page)
+    lead = meta_description(page) or ld.get("description", "")
+    if lead and (repeats_title(lead, title) or not re.search(r"[а-яё]{3}", lead.lower())):
+        lead = ""
+
+    # Текст статьи: из JSON-LD (самый чистый) или из абзацев страницы
+    if ld.get("articleBody") and good_text(ld["articleBody"]):
+        sentences = split_sentences(ld["articleBody"])
+    else:
+        sentences = [s for p in article_paragraphs(page) for s in split_sentences(p)]
+
+    text = lead
+    for sent in sentences:
+        if len(text) >= 220:
+            break
+        if len(sent) < 25 or repeats_title(sent, title) or is_boilerplate(sent):
+            continue
+        if sent[:60] in text:      # лид часто дословно совпадает с первым предложением
+            continue
+        text = f"{text} {sent}".strip()
+    return shorten(text) if len(text) >= 40 else ""
+
+
 def get_summary(article_url: str, title: str) -> str:
     try:
         page = http_get(article_url)
     except Exception as e:
         print(f"[warn] статья не открылась ({article_url}): {e}", file=sys.stderr)
         return ""
-    desc = ""
-    for pat in META_PATTERNS:
-        m = re.search(pat, page, flags=re.I)
-        if m:
-            desc = clean(m.group(1))
-            if len(desc) > 40 and not is_boilerplate(desc):
-                break
-            desc = ""
-    # Если описание пустое или просто повторяет заголовок — берём первый абзац
-    if len(desc) < 40 or desc.lower().startswith(title.lower()[:40]):
-        para = first_paragraph(page)
-        if para:
-            desc = para
-    if is_boilerplate(desc):
+    try:
+        return build_summary(page, title)
+    except Exception as e:  # кривая вёрстка не должна ломать весь дайджест
+        print(f"[warn] не удалось разобрать статью ({article_url}): {e}", file=sys.stderr)
         return ""
-    return shorten(desc) if len(desc) >= 40 else ""
 
 
 # ----------------------------- память --------------------------------------
