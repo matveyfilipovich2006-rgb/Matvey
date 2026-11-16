@@ -68,6 +68,37 @@ SPB_WORDS = [
     "северной столиц", "северная столиц",
 ]
 
+# ПРОВЕРЕННЫЕ ИСТОЧНИКИ — новости берутся только с этих сайтов (поддомены тоже).
+# Чтобы добавить издание, допишите его домен; чтобы убрать — удалите строку.
+TRUSTED_SOURCES = {
+    # Официальные
+    "gov.spb.ru": "Правительство Петербурга / КГИОП / КГА",
+    "spbdnevnik.ru": "Петербургский дневник",
+    "spbvedomosti.ru": "Санкт-Петербургские ведомости",
+    "vppress.ru": "Вечерний Санкт-Петербург",
+    # Городские и деловые СМИ
+    "fontanka.ru": "Фонтанка",
+    "dp.ru": "Деловой Петербург",
+    "rbc.ru": "РБК Петербург",
+    "kommersant.ru": "Коммерсантъ",
+    "interfax-russia.ru": "Интерфакс Северо-Запад",
+    "interfax.ru": "Интерфакс",
+    "tass.ru": "ТАСС",
+    "ria.ru": "РИА Новости",
+    "rosbalt.ru": "Росбалт",
+    "abnews.ru": "Агентство Бизнес Новостей",
+    "paperpaper.ru": "Бумага",
+    "paperpaper.io": "Бумага",
+    "mr7.ru": "Мой район",
+    "78.ru": "78.ru",
+    "peterburg2.ru": "Peterburg2",
+    "sobaka.ru": "Собака.ru (раздел «Реставрации»)",
+    # Отраслевые
+    "asninfo.ru": "Строительный еженедельник",
+    "ktostroit.ru": "Кто строит в Петербурге",
+    "archi.ru": "Архи.ру",
+}
+
 MAX_ITEMS = 15          # максимум новостей в одном дайджесте
 SUMMARY_MAX_CHARS = 350 # длина краткого описания
 # ---------------------------------------------------------------------------
@@ -107,7 +138,10 @@ def parse_feed(xml_text: str):
     for item in root.iter("item"):
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
-        source = (item.findtext("source") or "").strip()
+        src_el = item.find("source")
+        source = (src_el.text or "").strip() if src_el is not None else ""
+        src_url = src_el.get("url", "") if src_el is not None else ""
+        domain = urllib.parse.urlparse(src_url).netloc.lower().removeprefix("www.")
         pub = item.findtext("pubDate")
         try:
             dt = parsedate_to_datetime(pub) if pub else None
@@ -117,7 +151,12 @@ def parse_feed(xml_text: str):
         if source and title.endswith(" - " + source):
             title = title[: -len(" - " + source)].strip()
         if title and link:
-            yield {"title": title, "link": link, "source": source, "dt": dt}
+            yield {"title": title, "link": link, "source": source, "dt": dt, "domain": domain}
+
+
+def trusted(domain: str) -> bool:
+    """Сайт есть в списке проверенных (учитываются и поддомены: kgiop.gov.spb.ru → gov.spb.ru)."""
+    return any(domain == d or domain.endswith("." + d) for d in TRUSTED_SOURCES)
 
 
 def resolve_google_link(gn_url: str) -> str | None:
@@ -253,6 +292,8 @@ def collect(hours_back: int):
             continue
         for it in entries:
             if it["dt"] and it["dt"] < since:
+                continue
+            if not trusted(it["domain"]):
                 continue
             if not relevant(it["title"]):
                 continue
