@@ -99,20 +99,27 @@ CLASSIFY_ORDER = ["demolition", "restoration", "heritage", "projects"]
 PER_SECTION = 6   # максимум новостей в одном разделе
 MAX_TOTAL = 20    # максимум новостей во всём дайджесте
 
-# Новость берётся, только если в заголовке есть хоть одно из этих слов (тема архитектуры)
-MUST_CONTAIN_ANY = [
-    "реставр", "наслед", "памятник", "кгиоп", "охран", "истори", "снос", "фасад",
-    "особняк", "доходн", "усадьб", "собор", "церк", "храм", "реконструк", "архитект",
-    "дворц", "дворе", "ансамбл", "капремонт", "здани", "дом ", "проект", "конкурс",
-    "градсовет", "градостро", "пзз", "генплан", "кга", "квартал", "застрой",
-    "реновац", "небоскр", "высотн", "набережн", "площад", "мост",
+# Тема архитектуры. Слова сравниваются с НАЧАЛА слова: «снос» найдёт «сносить»,
+# но не «безопасность».
+# Новость берётся, если в заголовке есть хотя бы одно «сильное» слово...
+STRONG_WORDS = [
+    "реставр", "наслед", "кгиоп", "охранн", "снос", "снес", "фасад", "особняк",
+    "доходн", "усадьб", "реконструк", "архитект", "ансамбл", "градсовет", "градостро",
+    "пзз", "генплан", "кга", "застрой", "реновац", "небоскр", "высотк", "памятник архитект",
+    "объект культурного", "историческ", "градозащит", "конструктивизм",
+]
+# ...или хотя бы два «слабых» (одно слово «мост» или «проект» — ещё не про архитектуру)
+WEAK_WORDS = [
+    "памятник", "здани", "дом", "проект", "квартал", "набережн", "мост", "площад",
+    "собор", "храм", "церк", "дворц", "дворе", "капремонт", "конкурс", "сквер", "сад",
 ]
 
 # Слова-исключения: если есть в заголовке или описании — новость пропускаем
 EXCLUDE = [
-    "гороскоп", "погода", "футбол", "хоккей", "ярмарк", "церковный праздник",
+    "гороскоп", "погод", "футбол", "хоккей", "ярмарк", "церковный праздник",
     "бдение", "литурги", "митрополит", "богослужен", "ипотек", "цены на квартир",
-    "дтп", "убийств",
+    "дтп", "убийств", "спасл", "спасател", "пожар", "погиб", "задержа", "мошенни",
+    "спрыгн", "суицид",
 ]
 
 # Новость должна быть про Петербург: хотя бы одно из этих слов в заголовке или описании
@@ -127,7 +134,7 @@ SPB_WORDS = [
 # Чтобы добавить издание, допишите его домен; чтобы убрать — удалите строку.
 TRUSTED_SOURCES = {
     # Официальные
-    "gov.spb.ru": "Правительство Петербурга / КГИОП / КГА",
+    "gov.spb.ru": "Правительство Петербурга",
     "spbdnevnik.ru": "Петербургский дневник",
     "spbvedomosti.ru": "Санкт-Петербургские ведомости",
     "vppress.ru": "Вечерний Санкт-Петербург",
@@ -147,7 +154,7 @@ TRUSTED_SOURCES = {
     "mr7.ru": "Мой район",
     "78.ru": "78.ru",
     "peterburg2.ru": "Peterburg2",
-    "sobaka.ru": "Собака.ru (раздел «Реставрации»)",
+    "sobaka.ru": "Собака.ru",
     # Отраслевые
     "asninfo.ru": "Строительный еженедельник",
     "ktostroit.ru": "Кто строит в Петербурге",
@@ -212,9 +219,27 @@ def parse_feed(xml_text: str):
             yield {"title": title, "link": link, "source": source, "dt": dt, "domain": domain}
 
 
+def trusted_name(domain: str) -> str | None:
+    """Название издания из списка проверенных (поддомены тоже: kgiop.gov.spb.ru → gov.spb.ru)."""
+    for d, name in TRUSTED_SOURCES.items():
+        if domain == d or domain.endswith("." + d):
+            return name
+    return None
+
+
 def trusted(domain: str) -> bool:
-    """Сайт есть в списке проверенных (учитываются и поддомены: kgiop.gov.spb.ru → gov.spb.ru)."""
-    return any(domain == d or domain.endswith("." + d) for d in TRUSTED_SOURCES)
+    return trusted_name(domain) is not None
+
+
+def has_any(text: str, stems) -> bool:
+    """Есть ли в тексте слово, НАЧИНАЮЩЕЕСЯ с одного из корней."""
+    low = text.lower().replace("ё", "е")
+    return any(re.search(r"(?<![а-яa-z0-9])" + re.escape(s.replace("ё", "е")), low) for s in stems)
+
+
+def count_any(text: str, stems) -> int:
+    low = text.lower().replace("ё", "е")
+    return sum(1 for s in stems if re.search(r"(?<![а-яa-z0-9])" + re.escape(s), low))
 
 
 def resolve_google_link(gn_url: str) -> str | None:
@@ -276,7 +301,10 @@ def clean(text: str) -> str:
 
 def is_boilerplate(text: str) -> bool:
     low = text.lower()
-    return any(b in low for b in BOILERPLATE)
+    if any(b in low for b in BOILERPLATE):
+        return True
+    # куски CSS/JS-кода, которые некоторые сайты подсовывают вместо описания
+    return bool(re.search(r"[{}]|\w+\s*:\s*#[0-9a-f]{3,6}|function\s*\(", low))
 
 
 def first_paragraph(page: str) -> str:
@@ -318,6 +346,8 @@ def get_summary(article_url: str, title: str) -> str:
         para = first_paragraph(page)
         if para:
             desc = para
+    if is_boilerplate(desc):
+        return ""
     return shorten(desc) if len(desc) >= 40 else ""
 
 
@@ -364,19 +394,18 @@ def save_memory(path: str, mem: dict, items: list):
 
 # ----------------------------- сбор ----------------------------------------
 def relevant(title: str) -> bool:
-    low = title.lower() + " "
-    if any(x in low for x in EXCLUDE):
+    """Новость по теме архитектуры: одно «сильное» слово или два «слабых»."""
+    if has_any(title, EXCLUDE):
         return False
-    return any(x in low for x in MUST_CONTAIN_ANY)
+    return has_any(title, STRONG_WORDS) or count_any(title, WEAK_WORDS) >= 2
 
 
 def classify(title: str, summary: str, fallback: str) -> str:
     """Раздел новости: сначала смотрим заголовок (он точнее), потом описание."""
     by_key = {s["key"]: s for s in SECTIONS}
     for text in (title, title + " " + summary):
-        low = text.lower()
         for key in CLASSIFY_ORDER:
-            if any(w in low for w in by_key[key]["words"]):
+            if has_any(text, by_key[key]["words"]):
                 return key
     return fallback
 
@@ -442,10 +471,10 @@ def collect(hours_back: int, mem: dict) -> dict:
             it["link"] = real
             it["summary"] = get_summary(real, it["title"])
 
-        text = (it["title"] + " " + it["summary"]).lower()
-        if any(x in text for x in EXCLUDE):
+        text = it["title"] + " " + it["summary"]
+        if has_any(text, EXCLUDE):
             continue
-        if not any(x in text for x in SPB_WORDS):
+        if not has_any(text, SPB_WORDS):
             continue  # новость не про Петербург
         key = classify(it["title"], it["summary"], it["query_section"])
         if len(by_section[key]) >= PER_SECTION:
@@ -471,7 +500,8 @@ def plural_news(n: int) -> str:
 def format_item(it: dict) -> str:
     title = html.escape(it["title"])
     link = html.escape(it["link"], quote=True)
-    source = html.escape(it.get("source") or "Источник")
+    # Название издания — аккуратное, из нашего списка (а не «spbdnevnik.ru»)
+    source = html.escape(trusted_name(it.get("domain", "")) or it.get("source") or "Источник")
     lines = [f"▫️ <b>{title}</b>"]
     if it.get("summary"):
         lines.append(html.escape(it["summary"]))
