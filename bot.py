@@ -1,11 +1,12 @@
 """
-Утренний дайджест новостей об охране наследия и реставрации в Санкт-Петербурге.
+«Наследие Петербурга» — утренний дайджест новостей об архитектуре и наследии Санкт-Петербурга.
 
 Что делает:
-  1. Ищет свежие новости в Google Новостях по ключевым запросам.
-  2. Убирает дубли (одна новость часто выходит в нескольких изданиях).
-  3. Для каждой новости открывает саму статью и берёт оттуда краткое описание (лид).
-  4. Отправляет в Telegram: заголовок, 1–3 предложения о сути, издание, ссылка.
+  1. Ищет свежие новости в Google Новостях по запросам для каждого раздела.
+  2. Оставляет только проверенные издания и только новости про Петербург.
+  3. Убирает дубли и то, что уже присылал за последнюю неделю.
+  4. Для каждой новости открывает статью и берёт краткое описание (лид).
+  5. Присылает в Telegram подборку, разбитую на разделы.
 
 Работает на стандартной библиотеке Python — ничего ставить не нужно.
 
@@ -13,6 +14,7 @@
   TELEGRAM_BOT_TOKEN  — токен бота от @BotFather
   TELEGRAM_CHAT_ID    — кому слать; можно несколько через запятую
   HOURS_BACK          — за сколько часов брать новости (по умолчанию 24)
+  SENT_FILE           — файл памяти об отправленных новостях (по умолчанию sent.json)
 
 Проверка без отправки:  python bot.py --dry-run
 """
@@ -29,35 +31,88 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-# ---------------------------------------------------------------------------
-# НАСТРОЙКИ — здесь можно менять запросы под интересы папы
-# ---------------------------------------------------------------------------
-QUERIES = [
-    "КГИОП",
-    "Петербург реставрация",
-    'Петербург "объект культурного наследия"',
-    "Петербург памятник архитектуры",
-    "Петербург охранный статус здания",
-    "Петербург снос исторического здания",
-    "Петербург историческая застройка",
-    "Петербург реконструкция фасада",
-    "Петербург доходный дом",
-    "Петербург особняк реставрация",
+# ===========================================================================
+# НАСТРОЙКИ — всё, что можно менять под интересы папы, находится здесь
+# ===========================================================================
+
+# Разделы дайджеста. Порядок разделов = порядок в сообщении.
+#   queries — что искать в Google Новостях (слово «Петербург» лучше оставлять)
+#   words   — по каким словам новость относится к разделу (проверяются по порядку разделов)
+SECTIONS = [
+    {
+        "key": "demolition",
+        "title": "⚠️ Снос и споры",
+        "queries": [
+            "Петербург снос исторического здания",
+            "Петербург градозащитники",
+            "Петербург снос дома суд памятник",
+            "Петербург историческая застройка снос",
+        ],
+        "words": ["снос", "снесут", "снесл", "демонтаж", "градозащит", "утрат", "разрушен"],
+    },
+    {
+        "key": "heritage",
+        "title": "🏛 Охрана наследия",
+        "queries": [
+            "КГИОП",
+            'Петербург "объект культурного наследия"',
+            "Петербург охранный статус здания",
+            "Петербург памятник архитектуры",
+            "Петербург выявленный объект наследия",
+            "Петербург зоны охраны",
+        ],
+        "words": ["кгиоп", "охран", "статус", "наслед", "реестр", "памятник", "предмет охраны"],
+    },
+    {
+        "key": "restoration",
+        "title": "🔨 Реставрация",
+        "queries": [
+            "Петербург реставрация",
+            "Петербург реставрация фасада",
+            "Петербург приспособление памятника",
+            "Петербург реставрация усадьбы дворца",
+            "Петербург доходный дом реставрация",
+        ],
+        "words": ["реставр", "фасад", "приспособ", "реконструк", "капремонт", "воссозда", "восстанов"],
+    },
+    {
+        "key": "projects",
+        "title": "🏗 Новые проекты и градостроительство",
+        "queries": [
+            "Петербург градсовет",
+            "Петербург архитектурный конкурс",
+            "КГА Петербург согласовал проект",
+            "главный архитектор Петербурга",
+            "Петербург ПЗЗ",
+            "Петербург новый квартал архитектура",
+            "Петербург проект застройки",
+        ],
+        "words": ["градсовет", "конкурс", "пзз", "генплан", "кга", "квартал", "застрой",
+                  "главный архитектор", "небоскр", "высотн", "реновац", "проект"],
+    },
 ]
 
-# Новость попадает в дайджест, только если в заголовке есть хоть одно из этих слов
-# (отсекает случайные совпадения). Пустой список — фильтр выключен.
+# В каком порядке проверять слова разделов (самые «узкие» темы — первыми).
+# Например, «КГИОП согласовал проект реставрации» — это Реставрация, а не Охрана.
+CLASSIFY_ORDER = ["demolition", "restoration", "heritage", "projects"]
+
+PER_SECTION = 6   # максимум новостей в одном разделе
+MAX_TOTAL = 20    # максимум новостей во всём дайджесте
+
+# Новость берётся, только если в заголовке есть хоть одно из этих слов (тема архитектуры)
 MUST_CONTAIN_ANY = [
-    "реставр", "наслед", "памятник", "кгиоп", "охран", "истори", "снос",
-    "фасад", "особняк", "доходн", "усадьб", "собор", "церк", "храм",
-    "реконструк", "архитект", "дворц", "дворе", "ансамбл", "капремонт",
-    "здани", "дом ",
+    "реставр", "наслед", "памятник", "кгиоп", "охран", "истори", "снос", "фасад",
+    "особняк", "доходн", "усадьб", "собор", "церк", "храм", "реконструк", "архитект",
+    "дворц", "дворе", "ансамбл", "капремонт", "здани", "дом ", "проект", "конкурс",
+    "градсовет", "градостро", "пзз", "генплан", "кга", "квартал", "застрой",
+    "реновац", "небоскр", "высотн", "набережн", "площад", "мост",
 ]
 
 # Слова-исключения: если есть в заголовке или описании — новость пропускаем
 EXCLUDE = [
     "гороскоп", "погода", "футбол", "хоккей", "ярмарк", "церковный праздник",
-    "бдение", "литурги", "митрополит", "богослужен",
+    "бдение", "литурги", "митрополит", "богослужен", "ипотек", "цены на квартир",
+    "дтп", "убийств",
 ]
 
 # Новость должна быть про Петербург: хотя бы одно из этих слов в заголовке или описании
@@ -99,15 +154,18 @@ TRUSTED_SOURCES = {
     "archi.ru": "Архи.ру",
 }
 
-MAX_ITEMS = 15          # максимум новостей в одном дайджесте
-SUMMARY_MAX_CHARS = 350 # длина краткого описания
-# ---------------------------------------------------------------------------
+MEMORY_DAYS = 7          # сколько дней помнить отправленные новости
+SUMMARY_MAX_CHARS = 300  # длина краткого описания
+# ===========================================================================
 
 GN_SEARCH = "https://news.google.com/rss/search?q={q}&hl=ru&gl=RU&ceid=RU:ru"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 TG_LIMIT = 4000  # у Telegram лимит 4096 символов на сообщение
 MSK = timezone(timedelta(hours=3))
+WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+          "сентября", "октября", "ноября", "декабря"]
 
 
 # ----------------------------- сеть ----------------------------------------
@@ -133,7 +191,7 @@ def http_post(url: str, data: dict, timeout: int = 20) -> str:
 
 # ------------------------- Google Новости ----------------------------------
 def parse_feed(xml_text: str):
-    """Достаёт из RSS Google Новостей: заголовок, ссылку, издание, дату."""
+    """Достаёт из RSS Google Новостей: заголовок, ссылку, издание, его домен, дату."""
     root = ET.fromstring(xml_text)
     for item in root.iter("item"):
         title = (item.findtext("title") or "").strip()
@@ -204,17 +262,28 @@ META_PATTERNS = [
     r'<meta[^>]+name=["\']twitter:description["\'][^>]+content=["\']([^"\']+)',
 ]
 
+# Служебные фразы сайтов, которые не являются описанием статьи
+BOILERPLATE = [
+    "cookie", "всегда актуальные новости", "последние новости", "читайте также",
+    "подписывайтесь", "все права защищены", "главные новости",
+]
+
 
 def clean(text: str) -> str:
     text = html.unescape(re.sub(r"<[^>]+>", " ", text))
     return re.sub(r"\s+", " ", text).strip()
 
 
+def is_boilerplate(text: str) -> bool:
+    low = text.lower()
+    return any(b in low for b in BOILERPLATE)
+
+
 def first_paragraph(page: str) -> str:
     """Запасной вариант: первый содержательный абзац статьи."""
     for p in re.findall(r"<p[^>]*>(.*?)</p>", page, flags=re.S | re.I):
         t = clean(p)
-        if len(t) > 80 and "cookie" not in t.lower():
+        if len(t) > 80 and not is_boilerplate(t):
             return t
     return ""
 
@@ -241,8 +310,9 @@ def get_summary(article_url: str, title: str) -> str:
         m = re.search(pat, page, flags=re.I)
         if m:
             desc = clean(m.group(1))
-            if len(desc) > 40:
+            if len(desc) > 40 and not is_boilerplate(desc):
                 break
+            desc = ""
     # Если описание пустое или просто повторяет заголовок — берём первый абзац
     if len(desc) < 40 or desc.lower().startswith(title.lower()[:40]):
         para = first_paragraph(page)
@@ -251,7 +321,7 @@ def get_summary(article_url: str, title: str) -> str:
     return shorten(desc) if len(desc) >= 40 else ""
 
 
-# ----------------------------- сбор ----------------------------------------
+# ----------------------------- память --------------------------------------
 def title_words(title: str) -> set:
     """Значимые слова заголовка (по первым 5 буквам, чтобы «дома»/«дом» совпадали)."""
     t = re.sub(r"[^\w\s]", " ", title.lower())
@@ -269,104 +339,185 @@ def is_duplicate(words: set, seen: list, threshold: float = 0.6) -> bool:
     return False
 
 
+def load_memory(path: str) -> dict:
+    """Что уже отправляли за последние MEMORY_DAYS дней: ссылки и заголовки."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            mem = json.load(f)
+    except (OSError, ValueError):
+        return {"links": {}, "titles": []}
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=MEMORY_DAYS)).isoformat()
+    links = {k: v for k, v in mem.get("links", {}).items() if v >= cutoff}
+    titles = [t for t in mem.get("titles", []) if t.get("at", "") >= cutoff]
+    return {"links": links, "titles": titles}
+
+
+def save_memory(path: str, mem: dict, items: list):
+    now = datetime.now(timezone.utc).isoformat()
+    for it in items:
+        for link in {it["link"], it.get("gn_link", "")} - {""}:
+            mem["links"][link] = now
+        mem["titles"].append({"words": sorted(title_words(it["title"])), "at": now})
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(mem, f, ensure_ascii=False)
+
+
+# ----------------------------- сбор ----------------------------------------
 def relevant(title: str) -> bool:
     low = title.lower() + " "
     if any(x in low for x in EXCLUDE):
         return False
-    if not MUST_CONTAIN_ANY:
-        return True
     return any(x in low for x in MUST_CONTAIN_ANY)
 
 
-def collect(hours_back: int):
+def classify(title: str, summary: str, fallback: str) -> str:
+    """Раздел новости: сначала смотрим заголовок (он точнее), потом описание."""
+    by_key = {s["key"]: s for s in SECTIONS}
+    for text in (title, title + " " + summary):
+        low = text.lower()
+        for key in CLASSIFY_ORDER:
+            if any(w in low for w in by_key[key]["words"]):
+                return key
+    return fallback
+
+
+def search_candidates(hours_back: int, mem: dict) -> list:
     since = datetime.now(timezone.utc) - timedelta(hours=hours_back)
     days = max(1, (hours_back + 23) // 24)
-    seen_links, seen_titles, items = set(), [], []
+    seen_links = set(mem["links"])
+    seen_titles = [set(t["words"]) for t in mem["titles"]]
+    candidates = []
 
-    for q in QUERIES:
-        url = GN_SEARCH.format(q=urllib.parse.quote(f"{q} when:{days}d"))
-        try:
-            entries = list(parse_feed(http_get(url)))
-        except Exception as e:  # один упавший запрос не ломает весь дайджест
-            print(f"[warn] запрос «{q}» не удался: {e}", file=sys.stderr)
-            continue
-        for it in entries:
-            if it["dt"] and it["dt"] < since:
+    for sec in SECTIONS:
+        for q in sec["queries"]:
+            url = GN_SEARCH.format(q=urllib.parse.quote(f"{q} when:{days}d"))
+            try:
+                entries = list(parse_feed(http_get(url)))
+            except Exception as e:  # один упавший запрос не ломает весь дайджест
+                print(f"[warn] запрос «{q}» не удался: {e}", file=sys.stderr)
                 continue
-            if not trusted(it["domain"]):
-                continue
-            if not relevant(it["title"]):
-                continue
-            words = title_words(it["title"])
-            if it["link"] in seen_links or is_duplicate(words, seen_titles):
-                continue
-            seen_links.add(it["link"])
-            seen_titles.append(words)
-            items.append(it)
-        time.sleep(1)
+            for it in entries:
+                if it["dt"] and it["dt"] < since:
+                    continue
+                if not trusted(it["domain"]) or not relevant(it["title"]):
+                    continue
+                words = title_words(it["title"])
+                if it["link"] in seen_links or is_duplicate(words, seen_titles):
+                    continue
+                seen_links.add(it["link"])
+                seen_titles.append(words)
+                it["query_section"] = sec["key"]
+                candidates.append(it)
+            time.sleep(1)
 
     epoch = datetime.min.replace(tzinfo=timezone.utc)
-    items.sort(key=lambda x: x["dt"] or epoch, reverse=True)
-    items = items[: MAX_ITEMS * 2]  # с запасом: часть отсеется после чтения описаний
+    candidates.sort(key=lambda x: x["dt"] or epoch, reverse=True)
+    return candidates
 
-    # Для каждой новости — настоящая ссылка и краткое описание
-    result, real_links = [], set()
-    for it in items:
+
+def collect(hours_back: int, mem: dict) -> dict:
+    """Возвращает {раздел: [новости]} — уже с описаниями и прямыми ссылками."""
+    candidates = search_candidates(hours_back, mem)
+    print(f"Кандидатов после фильтров: {len(candidates)}")
+
+    by_section = {s["key"]: [] for s in SECTIONS}
+    real_links = set(mem["links"])
+    total = 0
+    for it in candidates:
+        if total >= MAX_TOTAL:
+            break
+        # раздел по заголовку — чтобы не тратить время на статьи для заполненных разделов
+        key = classify(it["title"], "", it["query_section"])
+        if len(by_section[key]) >= PER_SECTION:
+            continue
+
         real = resolve_google_link(it["link"])
+        time.sleep(1)
         if real and real in real_links:
-            continue  # та же статья, найденная разными запросами
+            continue  # та же статья (или уже отправленная раньше)
+        it["gn_link"] = it["link"]
+        it["summary"] = ""
         if real:
             real_links.add(real)
             it["link"] = real
             it["summary"] = get_summary(real, it["title"])
-        else:
-            it["summary"] = ""
-        time.sleep(1)
+
         text = (it["title"] + " " + it["summary"]).lower()
         if any(x in text for x in EXCLUDE):
             continue
         if not any(x in text for x in SPB_WORDS):
-            continue  # новость не про Петербург (Пенза, Ставрополь и т.п.)
-        result.append(it)
-    return result[:MAX_ITEMS]
+            continue  # новость не про Петербург
+        key = classify(it["title"], it["summary"], it["query_section"])
+        if len(by_section[key]) >= PER_SECTION:
+            continue
+        by_section[key].append(it)
+        total += 1
+    return by_section
 
 
-# --------------------------- Telegram --------------------------------------
-def format_item(i: int, it: dict) -> str:
+# --------------------------- оформление ------------------------------------
+def human_date(d: datetime) -> str:
+    return f"{WEEKDAYS[d.weekday()].capitalize()}, {d.day} {MONTHS[d.month - 1]}"
+
+
+def plural_news(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} новость"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} новости"
+    return f"{n} новостей"
+
+
+def format_item(it: dict) -> str:
     title = html.escape(it["title"])
     link = html.escape(it["link"], quote=True)
-    parts = [f"<b>{i}. {title}</b>"]
+    source = html.escape(it.get("source") or "Источник")
+    lines = [f"▫️ <b>{title}</b>"]
     if it.get("summary"):
-        parts.append(html.escape(it["summary"]))
-    meta = []
-    if it.get("source"):
-        meta.append(html.escape(it["source"]))
+        lines.append(html.escape(it["summary"]))
+    meta = f'<a href="{link}">{source} →</a>'
     if it.get("dt"):
-        meta.append(it["dt"].astimezone(MSK).strftime("%d.%m %H:%M"))
-    meta_str = " · ".join(meta)
-    parts.append(f'<a href="{link}">Читать →</a>' + (f"  <i>{meta_str}</i>" if meta_str else ""))
-    return "\n".join(parts)
+        local = it["dt"].astimezone(MSK)
+        today = datetime.now(MSK).date()
+        when = local.strftime("%H:%M") if local.date() == today else local.strftime("%d.%m, %H:%M")
+        meta += f" · {when}"
+    lines.append(meta)
+    return "\n".join(lines)
 
 
-def build_messages(items):
-    today = datetime.now(MSK).strftime("%d.%m.%Y")
-    header = f"🏛 <b>Наследие Петербурга — {today}</b>\n\n"
+def build_messages(by_section: dict) -> list:
+    now = datetime.now(MSK)
+    total = sum(len(v) for v in by_section.values())
+    header = (f"🏛 <b>Наследие Петербурга</b>\n"
+              f"<i>{human_date(now)} · {plural_news(total) if total else 'тихий день'}</i>")
 
-    if not items:
-        return [header + "За последние сутки новых новостей не нашлось."]
+    if not total:
+        return [header + "\n\nЗа последние сутки в проверенных источниках "
+                         "новых новостей по теме не было. До завтра! ☕"]
 
-    blocks = [format_item(i, it) for i, it in enumerate(items, 1)]
-    messages, cur = [], header
+    blocks = [header]
+    for sec in SECTIONS:
+        items = by_section.get(sec["key"]) or []
+        if not items:
+            continue
+        blocks.append(f"<b>{sec['title']}</b>")
+        blocks.extend(format_item(it) for it in items)
+    blocks.append("<i>Хорошего дня! Подборка приходит каждое утро.</i>")
+
+    # Склеиваем блоки в сообщения, не разрывая новость посередине
+    messages, cur = [], ""
     for block in blocks:
-        if len(cur) + len(block) + 2 > TG_LIMIT:
-            messages.append(cur.rstrip())
-            cur = ""
-        cur += block + "\n\n"
-    if cur.strip():
-        messages.append(cur.rstrip())
+        sep = "\n\n" if cur else ""
+        if len(cur) + len(sep) + len(block) > TG_LIMIT:
+            messages.append(cur)
+            cur, sep = "", ""
+        cur += sep + block
+    if cur:
+        messages.append(cur)
     return messages
 
 
+# --------------------------- Telegram --------------------------------------
 def send(token: str, chat_id: str, text: str):
     data = urllib.parse.urlencode({
         "chat_id": chat_id,
@@ -387,25 +538,40 @@ def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
     hours_back = int(os.environ.get("HOURS_BACK", "24"))
+    sent_file = os.environ.get("SENT_FILE", "sent.json")
     dry_run = "--dry-run" in sys.argv
 
     if not dry_run and (not token or not chat_ids):
         sys.exit("Не заданы TELEGRAM_BOT_TOKEN и/или TELEGRAM_CHAT_ID")
 
-    items = collect(hours_back)
-    messages = build_messages(items)
-    with_summary = sum(1 for it in items if it.get("summary"))
-    print(f"Найдено новостей: {len(items)}, с описанием: {with_summary}")
+    try:
+        mem = load_memory(sent_file)
+        by_section = collect(hours_back, mem)
+        messages = build_messages(by_section)
+        items = [it for v in by_section.values() for it in v]
+        with_summary = sum(1 for it in items if it.get("summary"))
+        print(f"В дайджесте: {len(items)}, с описанием: {with_summary}")
 
-    if dry_run:
-        print("\n\n---\n\n".join(messages))
-        return
+        if dry_run:
+            print("\n\n=====\n\n".join(messages))
+            return
 
-    for chat_id in chat_ids:
-        for msg in messages:
-            send(token, chat_id, msg)
-            time.sleep(0.5)
-    print("Дайджест отправлен.")
+        for chat_id in chat_ids:
+            for msg in messages:
+                send(token, chat_id, msg)
+                time.sleep(0.5)
+        save_memory(sent_file, mem, items)
+        print("Дайджест отправлен.")
+    except Exception as e:
+        # Сообщаем владельцу (первый chat_id), чтобы бот не «молчал» незаметно
+        if not dry_run and token and chat_ids:
+            try:
+                send(token, chat_ids[0],
+                     f"⚠️ Бот «Наследие Петербурга» не смог собрать подборку.\n"
+                     f"Ошибка: {html.escape(str(e))[:500]}")
+            except Exception:
+                pass
+        raise
 
 
 if __name__ == "__main__":
