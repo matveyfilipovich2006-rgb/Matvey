@@ -628,15 +628,24 @@ def format_item(it: dict) -> str:
     return "\n".join(lines)
 
 
+def is_evening(now: datetime | None = None) -> bool:
+    """Вечерний выпуск — всё, что запускается после 14:00 по Петербургу."""
+    return (now or datetime.now(MSK)).hour >= 14
+
+
 def build_messages(by_section: dict) -> list:
     now = datetime.now(MSK)
+    evening = is_evening(now)
     total = sum(len(v) for v in by_section.values())
-    header = (f"🏛 <b>Наследие Петербурга</b>\n"
+    edition = "вечерний выпуск" if evening else "утренний выпуск"
+    header = (f"🏛 <b>Наследие Петербурга</b> · {edition}\n"
               f"<i>{human_date(now)} · {plural_news(total) if total else 'тихий день'}</i>")
 
     if not total:
+        if evening:
+            return []  # вечером без новостей не беспокоим — ничего не присылаем
         return [header + "\n\nСвежих новостей по теме в проверенных источниках пока нет — "
-                         "всё важное уже было в прошлых подборках. До завтра! ☕"]
+                         "всё важное уже было в прошлых подборках. До вечера! ☕"]
 
     blocks = [header]
     for sec in SECTIONS:
@@ -645,7 +654,8 @@ def build_messages(by_section: dict) -> list:
             continue
         blocks.append(f"<b>{sec['title']}</b>")
         blocks.extend(format_item(it) for it in items)
-    blocks.append("<i>Хорошего дня! Подборка приходит каждое утро.</i>")
+    blocks.append("<i>Хорошего вечера! Следующая подборка — утром.</i>" if evening
+                  else "<i>Хорошего дня! Вечером пришлю, что появится за день.</i>")
 
     # Склеиваем блоки в сообщения, не разрывая новость посередине
     messages, cur = [], ""
