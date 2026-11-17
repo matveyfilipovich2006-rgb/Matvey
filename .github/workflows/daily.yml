@@ -2,9 +2,15 @@ name: Утренний дайджест
 
 on:
   schedule:
-    # 04:40 UTC = 07:40 по Петербургу. GitHub иногда запускает с задержкой 5–20 минут.
-    - cron: "40 4 * * *"
-  workflow_dispatch: {}  # кнопка «Run workflow» для ручного запуска
+    # Время в UTC. Петербург = UTC+3. GitHub иногда запускает с задержкой 5–20 минут.
+    - cron: "40 4 * * *"    # утренний выпуск — 07:40 по Петербургу
+    - cron: "45 15 * * *"   # вечерний выпуск — 18:45 по Петербургу
+  workflow_dispatch:  # кнопка «Run workflow» для ручного запуска
+    inputs:
+      hours:
+        description: "За сколько часов собрать новости (48 — обычно, 168 — за неделю)"
+        default: "48"
+        required: false
 
 jobs:
   send:
@@ -25,4 +31,5 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HOURS_BACK: ${{ inputs.hours || '48' }}
         run: python bot.py
